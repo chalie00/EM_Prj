@@ -342,25 +342,74 @@ def build_export_workbook(
         header_row = find_header_row(ws, get_sheet_header_labels(target_sheet))
         data_start = header_row + 1
         template_row = data_start
+        def _norm_header(value: object) -> str:
+            return re.sub(r"\s+", "", str(value or "")).strip()
+        header_map: Dict[str, int] = {}
+        for col_idx in range(1, ws.max_column + 1):
+            name = _norm_header(ws.cell(header_row, col_idx).value)
+            if name and name not in header_map:
+                header_map[name] = col_idx
+        alias_map = {
+            "쿠폰번호": ["쿠폰번호", "쿠폰 번호"],
+            "10000원": ["10000원", "10000원권", "10000"],
+            "5000원": ["5000원", "5000원권", "5000"],
+            "2000원": ["2000원", "2000원권", "2000"],
+            "1000원": ["1000원", "1000원권", "1000"],
+        }
+        def _resolve_col(col_name: str, default_idx: int) -> int:
+            candidates = alias_map.get(col_name, [col_name])
+            for cand in candidates:
+                key = _norm_header(cand)
+                if key in header_map:
+                    return header_map[key]
+            return default_idx
+        header_label_map = {
+            "10000원": "10000원",
+            "5000원": "5000원",
+            "2000원": "2000원",
+            "1000원": "1000원",
+        }
+        for col_idx, col_name in enumerate(columns, 1):
+            target_col = _resolve_col(col_name, col_idx)
+            header_cell = ws.cell(row=header_row, column=target_col)
+            if _norm_header(header_cell.value):
+                continue
+            if col_name in header_label_map:
+                header_cell.value = header_label_map[col_name]
+            elif col_name == COUPON_COLUMN:
+                header_cell.value = COUPON_COLUMN
+            elif col_name in ("날짜", "이름", "식당", "사용금액", "만나이", "성별"):
+                header_cell.value = col_name
         highlight_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-        original_map: Dict[str, Dict[str, int]] = {}
+        original_map: Dict[Tuple[str, str, str, str], Dict[str, int]] = {}
+        def _amount_key(row: pd.Series) -> Tuple[str, str, str, str]:
+            return (
+                str(row.get("날짜", "") or "").strip(),
+                str(row.get("이름", "") or "").strip(),
+                str(row.get("식당", "") or "").strip(),
+                str(row.get(COUPON_COLUMN, "") or "").strip(),
+            )
         if original_df is not None and not original_df.empty and COUPON_COLUMN in columns:
             for _, row in original_df.iterrows():
-                coupon_no = str(row.get(COUPON_COLUMN, "")).strip()
-                if not coupon_no:
+                key = _amount_key(row)
+                if not any(key):
                     continue
-                original_map[coupon_no] = {col: int(row.get(col, 0)) for col in AMOUNT_COLUMNS}
+                original_map[key] = {col: int(row.get(col, 0)) for col in AMOUNT_COLUMNS}
         for idx, (_, row) in enumerate(df.iterrows()):
             row_idx = data_start + idx
             if row_idx > ws.max_row:
                 ws.append([None] * len(columns))
             for col_idx, col_name in enumerate(columns, 1):
-                src_cell = ws.cell(row=template_row, column=col_idx)
-                dest_cell = ws.cell(row=row_idx, column=col_idx)
+                target_col = _resolve_col(col_name, col_idx)
+                src_cell = ws.cell(row=template_row, column=target_col)
+                dest_cell = ws.cell(row=row_idx, column=target_col)
                 if row_idx != template_row:
                     dest_cell._style = copy(src_cell._style)
                 src_value = src_cell.value
                 if src_value is not None and (src_cell.data_type == "f" or str(src_value).startswith("=")):
+                    if col_name in AMOUNT_COLUMNS:
+                        dest_cell.value = row.get(col_name, None)
+                        continue
                     if row_idx == template_row:
                         dest_cell.value = src_value
                     else:
@@ -382,8 +431,7 @@ def build_export_workbook(
                     if int(row.get("__amounts_changed") or 0) != 1:
                         dest_cell.fill = PatternFill(fill_type=None)
                         continue
-                    coupon_no = str(row.get(COUPON_COLUMN, "")).strip()
-                    original_vals = original_map.get(coupon_no, {})
+                    original_vals = original_map.get(_amount_key(row), {})
                     original_value = int(original_vals.get(col_name, 0))
                     new_value = int(row.get(col_name, 0))
                     if new_value != original_value:
@@ -394,7 +442,8 @@ def build_export_workbook(
         last_row = data_start + len(df) - 1
         for row_idx in range(last_row + 1, ws.max_row + 1):
             for col_idx in range(1, len(columns) + 1):
-                ws.cell(row=row_idx, column=col_idx).value = None
+                target_col = _resolve_col(columns[col_idx - 1], col_idx)
+                ws.cell(row=row_idx, column=target_col).value = None
         update_restaurant_sheet(wb)
         wb.save(path)
         return
@@ -490,80 +539,70 @@ class App:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        top_bar = ttk.Frame(self.root, padding=10)
-        top_bar.grid(row=0, column=0, sticky="ew")
-        top_bar.columnconfigure(2, weight=1)
+        self.top_bar = ttk.Frame(self.root, padding=10)
+        self.top_bar.grid(row=0, column=0, sticky="ew")
+        self.top_bar.columnconfigure(0, weight=1)
+        self.top_bar.columnconfigure(1, weight=1)
 
-        source_frame = ttk.LabelFrame(top_bar, text="원본/사진 분석", padding=8)
-        source_frame.grid(row=0, column=0, padx=(0, 8), sticky="w")
+        source_frame = ttk.LabelFrame(self.top_bar, text="원본/사진 분석", padding=8)
+        source_frame.grid(row=0, column=0, padx=(0, 8), sticky="ew")
 
         ttk.Button(source_frame, text="원본 불러오기", command=self.browse_excel).grid(row=0, column=0, padx=4, pady=2)
         ttk.Button(source_frame, text="참여자 불러오기", command=self.browse_participant).grid(
             row=0, column=1, padx=4, pady=2
         )
-        ttk.Label(source_frame, text="Sheet:").grid(row=0, column=2, padx=(12, 2), pady=2)
+        ttk.Label(source_frame, text="월별:").grid(row=0, column=2, padx=(12, 2), pady=2)
         self.sheet_combo = ttk.Combobox(source_frame, textvariable=self.sheet_var, state="disabled", width=18)
         self.sheet_combo.grid(row=0, column=3, padx=4, pady=2)
         self.sheet_combo.bind("<<ComboboxSelected>>", self.on_sheet_selected)
-        ttk.Button(source_frame, text="사진 선택 (복수)", command=self.browse_photos).grid(row=0, column=4, padx=4, pady=2)
-        ttk.Label(source_frame, text="Grid:").grid(row=0, column=5, padx=(12, 2), pady=2)
-        self.cols_var = tk.IntVar(value=2)
-        self.rows_var = tk.IntVar(value=3)
-        ttk.Spinbox(source_frame, from_=1, to=5, textvariable=self.cols_var, width=4).grid(row=0, column=6, pady=2)
-        ttk.Label(source_frame, text="x").grid(row=0, column=7, pady=2)
-        ttk.Spinbox(source_frame, from_=1, to=5, textvariable=self.rows_var, width=4).grid(row=0, column=8, pady=2)
-        ttk.Button(source_frame, text="사진 분석", command=self.run_analysis).grid(row=0, column=9, padx=8, pady=2)
-        ttk.Button(source_frame, text="내보내기", command=self.export_excel).grid(row=0, column=10, padx=4, pady=2)
-        ttk.Button(source_frame, text="폴더 열기", command=self.open_export_folder).grid(row=0, column=11, padx=4, pady=2)
-
-        amount_frame = ttk.LabelFrame(top_bar, text="금액 계산", padding=8)
-        amount_frame.grid(row=0, column=1, padx=(0, 8), sticky="w")
-
-        ttk.Button(amount_frame, text="금액 계산 원본 열기", command=self.open_amount_source).grid(row=0, column=0, padx=4, pady=2)
-        ttk.Label(amount_frame, text="원하는 금액:").grid(row=0, column=1, padx=(12, 2), pady=2)
-        ttk.Entry(amount_frame, textvariable=self.amount_target_var, width=10).grid(row=0, column=2, pady=2)
-        ttk.Button(amount_frame, text="금액수정하기", command=self.adjust_amounts).grid(row=0, column=3, padx=8, pady=2)
-        ttk.Button(amount_frame, text="금액 내보내기", command=self.export_amount_table).grid(row=0, column=4, padx=4, pady=2)
-        ttk.Label(amount_frame, text="식당 이름:").grid(row=0, column=5, padx=(12, 2), pady=2)
-        ttk.Entry(amount_frame, textvariable=self.restaurant_input_var, width=16).grid(row=0, column=6, pady=2)
-        ttk.Button(amount_frame, text="식당저장", command=self.save_restaurant).grid(row=0, column=7, padx=4, pady=2)
-        ttk.Button(amount_frame, text="식당삭제", command=self.delete_restaurant).grid(row=0, column=8, padx=4, pady=2)
-
-        self.status_var = tk.StringVar(value="준비 완료")
-        ttk.Label(top_bar, textvariable=self.status_var).grid(row=0, column=2, sticky="e")
+        ttk.Button(source_frame, text="내보내기", command=self.export_excel).grid(row=0, column=4, padx=4, pady=2)
+        ttk.Button(source_frame, text="폴더 열기", command=self.open_export_folder).grid(row=0, column=5, padx=4, pady=2)
 
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.grid(row=1, column=0, sticky="nsew")
         main_frame.columnconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=0)
-        main_frame.columnconfigure(2, weight=1)
-        main_frame.columnconfigure(3, weight=0)
-        main_frame.rowconfigure(1, weight=1)
-        main_frame.rowconfigure(3, weight=1)
-        main_frame.rowconfigure(5, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(0, weight=1)
 
-        # Imported excel panel
-        self.import_label = ttk.Label(main_frame, text="원본 파일")
-        self.import_label.grid(row=0, column=0, columnspan=2, sticky="w")
-        self.import_tree, import_vsb = self._make_tree(main_frame)
-        self.import_tree.grid(row=1, column=0, sticky="nsew", padx=(0, 2))
+        self.left_panel = ttk.Frame(main_frame)
+        self.left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.left_panel.columnconfigure(0, weight=1)
+        self.left_panel.rowconfigure(1, weight=1)
+        self.left_panel.rowconfigure(3, weight=0)
+        self.left_panel.rowconfigure(4, weight=0)
+        self.left_panel.rowconfigure(5, weight=1)
+
+        self.right_panel = ttk.Frame(main_frame)
+        self.right_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self.right_panel.columnconfigure(0, weight=1)
+        self.right_panel.rowconfigure(1, weight=1)
+        self.right_panel.rowconfigure(5, weight=1)
+
+        # Imported excel panel (left)
+        self.import_label = ttk.Label(self.left_panel, text="원본 파일")
+        self.import_label.grid(row=0, column=0, sticky="w")
+        self.import_tree, import_vsb = self._make_tree(self.left_panel)
+        self.import_tree.grid(row=1, column=0, sticky="nsew")
         import_vsb.grid(row=1, column=1, sticky="ns")
         self.import_tree.tag_configure("hover", background="#dff0d8")
         self.import_tree.bind("<Motion>", self.on_import_hover)
         self.import_tree.bind("<Leave>", self.on_import_leave)
 
-        ttk.Label(main_frame, text="참여자 목록").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.participant_tree = ttk.Treeview(main_frame, columns=[], show="headings", height=8)
-        participant_vsb = ttk.Scrollbar(main_frame, orient="vertical", command=self.participant_tree.yview)
-        self.participant_tree.configure(yscrollcommand=participant_vsb.set)
-        self.participant_tree.grid(row=3, column=0, sticky="nsew", padx=(0, 2))
-        participant_vsb.grid(row=3, column=1, sticky="ns")
+        self._left_spacer = ttk.Frame(self.left_panel)
+        self._left_spacer.grid(row=3, column=0, columnspan=2, sticky="ew")
 
-        # OCR result panel
-        ttk.Label(main_frame, text="사진 분석 결과").grid(row=0, column=2, columnspan=2, sticky="w")
-        self.ocr_tree, ocr_vsb = self._make_tree(main_frame)
-        self.ocr_tree.grid(row=1, column=2, sticky="nsew", padx=(2, 0))
-        ocr_vsb.grid(row=1, column=3, sticky="ns")
+        ttk.Label(self.left_panel, text="참여자 목록").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.participant_tree = ttk.Treeview(self.left_panel, columns=[], show="headings", height=8)
+        participant_vsb = ttk.Scrollbar(self.left_panel, orient="vertical", command=self.participant_tree.yview)
+        self.participant_tree.configure(yscrollcommand=participant_vsb.set)
+        self.participant_tree.grid(row=5, column=0, sticky="nsew")
+        participant_vsb.grid(row=5, column=1, sticky="ns")
+
+        # OCR result panel (right)
+        ttk.Label(self.right_panel, text="신규 입력").grid(row=0, column=0, sticky="w")
+        self.ocr_tree, ocr_vsb = self._make_tree(self.right_panel)
+        self.ocr_tree.grid(row=1, column=0, sticky="nsew")
+        ocr_vsb.grid(row=1, column=1, sticky="ns")
         self.ocr_tree.bind("<Double-1>", self.on_ocr_double_click)
         self.ocr_tree.bind("<ButtonRelease-1>", self.on_ocr_single_click)
         self.ocr_tree.bind("<Button-3>", self.on_ocr_right_click)
@@ -571,12 +610,49 @@ class App:
         self.ocr_menu.add_command(label="삭제", command=self.delete_selected_ocr)
         self._populate_tree(self.ocr_tree, self.ocr_df)
 
-        ttk.Label(main_frame, text="금액 계산 목록").grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
-        self.amount_tree, amount_vsb = self._make_amount_tree(main_frame)
-        self.amount_tree.grid(row=3, column=2, sticky="nsew", padx=(2, 0))
-        amount_vsb.grid(row=3, column=3, sticky="ns")
+        self._amount_frame = ttk.LabelFrame(self.right_panel, text="금액 계산", padding=8)
+        self._amount_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._amount_frame.columnconfigure(9, weight=1)
+
+        ttk.Button(self._amount_frame, text="금액 계산 원본 열기", command=self.open_amount_source).grid(row=0, column=0, padx=4, pady=2)
+        ttk.Label(self._amount_frame, text="원하는 금액:").grid(row=0, column=1, padx=(12, 2), pady=2)
+        ttk.Entry(self._amount_frame, textvariable=self.amount_target_var, width=10).grid(row=0, column=2, pady=2)
+        ttk.Button(self._amount_frame, text="금액수정하기", command=self.adjust_amounts).grid(row=0, column=3, padx=8, pady=2)
+        ttk.Button(self._amount_frame, text="금액 내보내기", command=self.export_amount_table).grid(row=0, column=4, padx=4, pady=2)
+
+        ttk.Label(self.right_panel, text="금액 계산 목록").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.amount_tree, amount_vsb = self._make_amount_tree(self.right_panel)
+        self.amount_tree.grid(row=5, column=0, sticky="nsew")
+        amount_vsb.grid(row=5, column=1, sticky="ns")
         self.amount_tree.bind("<Double-1>", self.on_amount_double_click)
         self._populate_amount_tree()
+
+        right_bar = ttk.Frame(self.top_bar)
+        right_bar.grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        right_bar.columnconfigure(0, weight=1)
+        right_bar.columnconfigure(1, weight=1)
+
+        restaurant_frame = ttk.LabelFrame(right_bar, text="", padding=4)
+        restaurant_frame.grid(row=0, column=0, sticky="w")
+        ttk.Label(restaurant_frame, text="식당 이름:").grid(row=0, column=0, padx=(0, 2), pady=2)
+        ttk.Entry(restaurant_frame, textvariable=self.restaurant_input_var, width=16).grid(row=0, column=1, pady=2)
+        ttk.Button(restaurant_frame, text="식당저장", command=self.save_restaurant).grid(row=0, column=2, padx=4, pady=2)
+        ttk.Button(restaurant_frame, text="식당삭제", command=self.delete_restaurant).grid(row=0, column=3, padx=4, pady=2)
+
+        photo_frame = ttk.LabelFrame(right_bar, text="", padding=4)
+        photo_frame.grid(row=0, column=1, sticky="e")
+        ttk.Button(photo_frame, text="사진 선택 (복수)", command=self.browse_photos).grid(row=0, column=0, padx=4, pady=2)
+        ttk.Label(photo_frame, text="Grid:").grid(row=0, column=1, padx=(12, 2), pady=2)
+        self.cols_var = tk.IntVar(value=2)
+        self.rows_var = tk.IntVar(value=3)
+        ttk.Spinbox(photo_frame, from_=1, to=5, textvariable=self.cols_var, width=4).grid(row=0, column=2, pady=2)
+        ttk.Label(photo_frame, text="x").grid(row=0, column=3, pady=2)
+        ttk.Spinbox(photo_frame, from_=1, to=5, textvariable=self.rows_var, width=4).grid(row=0, column=4, pady=2)
+        ttk.Button(photo_frame, text="사진 분석", command=self.run_analysis).grid(row=0, column=5, padx=8, pady=2)
+
+        self.status_var = tk.StringVar(value="준비 완료")
+        self.root.after(0, self._sync_topbar_columns)
+        self.root.bind("<Configure>", self._on_root_configure)
 
         # Missing info panel
         missing_frame = ttk.Frame(self.root, padding=10)
@@ -585,6 +661,26 @@ class App:
         self.missing_text = tk.Text(missing_frame, height=4)
         self.missing_text.grid(row=1, column=0, sticky="ew")
         missing_frame.columnconfigure(0, weight=1)
+    def _sync_topbar_columns(self) -> None:
+        if not hasattr(self, "top_bar"):
+            return
+        if not hasattr(self, "left_panel") or not hasattr(self, "right_panel"):
+            return
+        left_w = self.left_panel.winfo_width()
+        right_w = self.right_panel.winfo_width()
+        if left_w > 0:
+            self.top_bar.columnconfigure(0, minsize=left_w)
+        if right_w > 0:
+            self.top_bar.columnconfigure(1, minsize=right_w)
+        self._sync_panel_heights()
+    def _sync_panel_heights(self) -> None:
+        if not hasattr(self, "_left_spacer") or not hasattr(self, "_amount_frame"):
+            return
+        target = self._amount_frame.winfo_height()
+        if target > 0:
+            self.left_panel.rowconfigure(3, minsize=target)
+    def _on_root_configure(self, _: tk.Event) -> None:
+        self._sync_topbar_columns()
     def _configure_participant_tree(self, columns: List[str]) -> None:
         self.participant_tree["columns"] = columns
         for col in columns:
@@ -1012,7 +1108,7 @@ class App:
         if not row_id or not col_id:
             return
         columns = list(self.ocr_tree["columns"])
-        if columns != OCR_COLUMNS:
+        if columns not in (TABLE_COLUMNS, OCR_COLUMNS):
             return
         col_index = int(col_id.replace("#", "")) - 1
         if col_index < 0 or col_index >= len(columns):
@@ -1106,11 +1202,13 @@ class App:
         if self.ocr_df is None:
             return
         columns = list(self.ocr_tree["columns"])
-        if columns != OCR_COLUMNS:
-            return
         row_id = self.ocr_tree.identify_row(event.y)
         col_id = self.ocr_tree.identify_column(event.x)
         if not row_id or not col_id:
+            return
+        self.ocr_tree.selection_set(row_id)
+        self.ocr_tree.focus(row_id)
+        if columns not in (TABLE_COLUMNS, OCR_COLUMNS):
             return
         col_index = int(col_id.replace("#", "")) - 1
         if col_index < 0 or col_index >= len(columns):
@@ -1135,11 +1233,29 @@ class App:
         def save_select(_: Optional[tk.Event] = None) -> None:
             new_value = combo.get().strip()
             row_index = self.ocr_tree.index(row_id)
-            if row_index < len(self.ocr_df):
-                self.ocr_df.at[row_index, column_name] = new_value
-                self.ocr_tree.set(row_id, column_name, new_value)
-                if self.import_sheet:
-                    self.ocr_dfs[self.import_sheet] = self.ocr_df
+            is_new_row = row_index >= len(self.ocr_df)
+            if is_new_row:
+                new_row = {col: 0 for col in AMOUNT_COLUMNS}
+                new_row.update(
+                    {
+                        "날짜": "",
+                        "이름": None,
+                        "식당": "",
+                        "사용금액": 0,
+                        COUPON_COLUMN: "",
+                        "만나이": None,
+                        "성별": None,
+                        OCR_TOTAL_COLUMN: 0,
+                    }
+                )
+                self.ocr_df = pd.concat([self.ocr_df, pd.DataFrame([new_row])], ignore_index=True)
+            self.ocr_df.at[row_index, column_name] = new_value
+            self.ocr_tree.set(row_id, column_name, new_value)
+            if is_new_row:
+                self._populate_tree(self.ocr_tree, self.ocr_df)
+            if self.import_sheet:
+                self.ocr_dfs[self.import_sheet] = self.ocr_df
+            self._show_missing()
             combo.destroy()
             self._edit_entry = None
         def cancel_select(_: Optional[tk.Event] = None) -> None:
